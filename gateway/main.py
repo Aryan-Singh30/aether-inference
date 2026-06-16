@@ -2,10 +2,12 @@ import asyncio
 import json
 import logging
 import random
+import time
 from contextlib import asynccontextmanager
 import aio_pika
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # Import our custom resiliency components from the shared folder
@@ -25,8 +27,11 @@ resource_monitor = SystemResourceMonitor(memory_limit_mb=1024.0, fd_limit=100)
 # Lifespan Context Manager handles startup and shutdown logic cleanly in modern FastAPI
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Initialize RabbitMQ connection
+    # Startup: Initialize RabbitMQ connection and chaos parameters
     logger.info("Initializing background services...")
+    app.state.chaos_rabbitmq = False
+    app.state.chaos_mem_leak = 0.0
+    app.state.chaos_handles_leak = 0
     
     try:
         # Connect to RabbitMQ using standard default local credentials
@@ -105,6 +110,8 @@ async def health_check():
 
 # Helper to perform the actual RabbitMQ publish, which our Circuit Breaker will execute
 async def _rabbitmq_publish(payload: dict):
+    if getattr(app.state, "chaos_rabbitmq", False):
+        raise ConnectionError("Chaos simulation: RabbitMQ connection lost.")
     await app.state.rabbitmq_channel.default_exchange.publish(
         aio_pika.Message(
             body=json.dumps(payload).encode(),
@@ -113,15 +120,21 @@ async def _rabbitmq_publish(payload: dict):
         routing_key="inference_tasks"
     )
 
+# Mock publish function for when RabbitMQ is offline, to support circuit breaker simulation
+async def _mock_publish(payload: dict):
+    if getattr(app.state, "chaos_rabbitmq", False):
+        raise ConnectionError("Chaos simulation: Mock queue connection lost.")
+    await asyncio.sleep(0.01)  # Simulate small queue processing delay
+
 # 2. Submit Task (Sends jobs to the background queue)
 @app.post("/submit")
 async def submit_task(request: TaskRequest):
     logger.info(f"Received task request: query='{request.query}', type='{request.task_type}'")
     
-    # Run active resource limit checks
-    metrics = resource_monitor.check_limits()
-    if not metrics["memory_ok"]:
-        logger.warning("Rejecting task submission due to critical server memory limits.")
+    # Run active resource limit checks including simulated chaos leaks
+    current_mem = resource_monitor.get_memory_usage_mb() + getattr(app.state, "chaos_mem_leak", 0.0)
+    if current_mem >= resource_monitor.memory_limit_mb:
+        logger.warning(f"Rejecting task submission due to critical server memory limits. Current: {current_mem:.1f} MB, Limit: {resource_monitor.memory_limit_mb} MB")
         raise HTTPException(status_code=503, detail="Server is overloaded. Please try again later.")
     
     task_id = f"task_{random.randint(100000, 999999)}"
@@ -131,43 +144,36 @@ async def submit_task(request: TaskRequest):
         "task_type": request.task_type
     }
     
-    # Check if we have an active RabbitMQ connection
-    if hasattr(app.state, "rabbitmq_status") and app.state.rabbitmq_status == "connected":
-        try:
-            # Wrap the RabbitMQ push inside our Circuit Breaker!
-            # If RabbitMQ goes down, the circuit breaker will trip and switch to OPEN.
-            await circuit_breaker.call(_rabbitmq_publish, task_payload)
-            logger.info(f"Published task {task_id} to RabbitMQ queue 'inference_tasks'.")
-            return {
-                "status": "queued",
-                "task_id": task_id,
-                "message": "Task queued successfully in RabbitMQ.",
-                "circuit_state": circuit_breaker.state
-            }
-        except CircuitBreakerOpenException as cbe:
-            # The circuit breaker prevented the network call completely!
-            logger.warning(f"Circuit Breaker blocked submission of task {task_id}: {cbe}")
-            # Instead of failing with an error, we gracefully fallback to mock response (fail-fast resilience)
-            return {
-                "status": "queued_fallback",
-                "task_id": task_id,
-                "message": "System is degraded. Task queued successfully in Mock Mode (Circuit Breaker Tripped).",
-                "circuit_state": circuit_breaker.state
-            }
-        except Exception as e:
-            logger.error(f"Task submission failed: {e}")
-            # If a generic network exception occurred, the circuit breaker recorded the failure.
-            # We fail-fast with a 503 error for this request.
-            raise HTTPException(status_code=503, detail="Task queue service is currently unavailable.")
-    else:
-        # Fallback Mock mode (runs if RabbitMQ was not detected during startup)
-        logger.info(f"RabbitMQ is offline. Running task {task_id} in Mock Mode.")
+    is_connected = hasattr(app.state, "rabbitmq_status") and app.state.rabbitmq_status == "connected"
+    publish_func = _rabbitmq_publish if is_connected else _mock_publish
+    status_success = "queued" if is_connected else "queued_mock"
+    message_success = "Task queued successfully in RabbitMQ." if is_connected else "Task received and queued successfully (Mock Mode - RabbitMQ Offline)."
+    
+    try:
+        # Wrap the publish call in our Circuit Breaker
+        await circuit_breaker.call(publish_func, task_payload)
+        logger.info(f"Published task {task_id} successfully (connected={is_connected}).")
         return {
-            "status": "queued_mock",
+            "status": status_success,
             "task_id": task_id,
-            "message": "Task received and queued successfully (Mock Mode - RabbitMQ Offline).",
-            "circuit_state": "MOCK_MODE"
+            "message": message_success,
+            "circuit_state": circuit_breaker.state
         }
+    except CircuitBreakerOpenException as cbe:
+        # The circuit breaker prevented the network call completely!
+        logger.warning(f"Circuit Breaker blocked submission of task {task_id}: {cbe}")
+        # Instead of failing with an error, we gracefully fallback to mock response (fail-fast resilience)
+        return {
+            "status": "queued_fallback",
+            "task_id": task_id,
+            "message": "System is degraded. Task queued successfully in Mock Mode (Circuit Breaker Tripped).",
+            "circuit_state": circuit_breaker.state
+        }
+    except Exception as e:
+        logger.error(f"Task submission failed: {e}")
+        # If a generic exception occurred, the circuit breaker recorded the failure.
+        # We fail-fast with a 503 error for this request.
+        raise HTTPException(status_code=503, detail="Task queue service is currently unavailable.")
 
 # --- WebSocket Telemetry ---
 # WebSockets keep a permanent open pipe between the client and server.
@@ -223,21 +229,30 @@ async def telemetry_broadcaster():
             # Read ACTUAL system stats from the running process!
             cpu_usage = resource_monitor.process.cpu_percent(interval=None)
             
-            # RAM usage of our Python process in MB
-            mem_mb = resource_monitor.get_memory_usage_mb()
+            # RAM usage of our Python process in MB (with injected chaos leak)
+            mem_mb = resource_monitor.get_memory_usage_mb() + getattr(app.state, "chaos_mem_leak", 0.0)
             
-            # Count of active open file descriptor handles (Windows/Linux check)
-            active_handles = resource_monitor.get_file_descriptor_count()
+            # Count of active open file descriptor handles (with injected chaos leak)
+            active_handles = resource_monitor.get_file_descriptor_count() + getattr(app.state, "chaos_handles_leak", 0)
             
-            # Read circuit breaker state
-            circuit_state = circuit_breaker.state if app.state.rabbitmq_status == "connected" else "MOCK_MODE"
+            # Read circuit breaker state (works in both real queue and mock queue modes)
+            circuit_state = circuit_breaker.state
+            
+            # Get actual queue depth from RabbitMQ if connected
+            queue_depth = 0
+            if hasattr(app.state, "rabbitmq_status") and app.state.rabbitmq_status == "connected":
+                try:
+                    queue = await app.state.rabbitmq_channel.declare_queue("inference_tasks", passive=True)
+                    queue_depth = queue.declaration_result.message_count
+                except Exception:
+                    pass
             
             # Pack actual stats to broadcast
             stats = {
                 "cpu_usage": round(cpu_usage, 1),
                 "memory_usage": round(mem_mb, 2),                  # in MB
-                "active_fds": active_handles,                      # Real active system handle count
-                "queue_depth": 0,                                  # Will be read from RabbitMQ channels in later phases
+                "active_fds": active_handles,                      # Real active system handle count + leak
+                "queue_depth": queue_depth,                        # Read dynamically from RabbitMQ channels
                 "average_latency_ms": round(random.uniform(8.0, 15.0), 1), # Simulated latencies
                 "circuit_breaker_state": circuit_state
             }
@@ -250,4 +265,44 @@ async def telemetry_broadcaster():
         # Stream telemetry data every 1 second
         await asyncio.sleep(1.0)
 
-# Note: Background telemetry is now managed via the lifespan handler above
+# --- Chaos Simulation Endpoints ---
+
+@app.post("/chaos/trip")
+async def chaos_trip():
+    """Simulate RabbitMQ queue connection failure."""
+    app.state.chaos_rabbitmq = True
+    logger.warning("Chaos Command: Simulating RabbitMQ queue failure.")
+    return {"message": "RabbitMQ connection failure simulated."}
+
+@app.post("/chaos/leak")
+async def chaos_leak():
+    """Inject a memory leak (250MB) and handle leak (20) to simulate resource exhaustion."""
+    app.state.chaos_mem_leak += 250.0
+    app.state.chaos_handles_leak += 20
+    logger.warning(
+        f"Chaos Command: Injected leaks. "
+        f"Total simulated leaks: Memory={app.state.chaos_mem_leak}MB, Handles={app.state.chaos_handles_leak}"
+    )
+    return {
+        "message": "Leak injected.",
+        "simulated_memory_leak_mb": app.state.chaos_mem_leak,
+        "simulated_handles_leak": app.state.chaos_handles_leak
+    }
+
+@app.post("/chaos/reset")
+async def chaos_reset():
+    """Reset all chaos variables and return circuit breaker to closed state."""
+    app.state.chaos_rabbitmq = False
+    app.state.chaos_mem_leak = 0.0
+    app.state.chaos_handles_leak = 0
+    
+    # Force reset circuit breaker state
+    circuit_breaker.state = "CLOSED"
+    circuit_breaker.failure_count = 0
+    circuit_breaker.last_state_change = time.time()
+    
+    logger.info("Chaos Command: Resetting system health. Circuit Breaker restored to CLOSED.")
+    return {"message": "System health restored to healthy defaults."}
+
+# Mount the frontend static files at the very bottom
+app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")

@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AetherInference - Telemetry & Resiliency Control</title>
+    <!-- Google Fonts for premium typography -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- FontAwesome for modern icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Links to our stylesheet -->
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="app-container">
+        
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar">
+            <div class="logo-area">
+                <i class="fa-solid fa-microchip logo-icon"></i>
+                <h2>Aether<span>Inference</span></h2>
+            </div>
+            <nav class="nav-menu">
+                <a href="#dashboard" class="nav-item active"><i class="fa-solid fa-chart-line"></i> Dashboard</a>
+                <a href="#runner" class="nav-item"><i class="fa-solid fa-play"></i> Task Runner</a>
+                <a href="#chaos" class="nav-item"><i class="fa-solid fa-circle-radiation"></i> Chaos Sandbox</a>
+            </nav>
+            <div class="status-footer">
+                <span class="pulse-indicator online" id="ws-indicator"></span>
+                <span id="connection-status">Connecting to Gateway...</span>
+            </div>
+        </aside>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            
+            <!-- Header -->
+            <header class="app-header">
+                <div>
+                    <h1>System Telemetry & Control Panel</h1>
+                    <p>Real-time process monitoring, ONNX serving, and failure isolation.</p>
+                </div>
+                <div class="header-badge">
+                    <span class="badge-label">CIRCUIT STATE:</span>
+                    <span class="badge" id="circuit-badge">UNKNOWN</span>
+                </div>
+            </header>
+
+            <!-- Metrics Grid -->
+            <section class="metrics-grid">
+                <!-- 1. CPU Usage Card -->
+                <div class="metric-card">
+                    <div class="card-header">
+                        <span>CPU Usage (Process)</span>
+                        <i class="fa-solid fa-cpu-chip icon-cpu"></i>
+                    </div>
+                    <div class="card-value"><span id="metric-cpu">0.0</span>%</div>
+                    <div class="card-bar-wrapper">
+                        <div class="card-bar" id="bar-cpu" style="width: 0%"></div>
+                    </div>
+                </div>
+
+                <!-- 2. Memory RSS Card -->
+                <div class="metric-card">
+                    <div class="card-header">
+                        <span>Physical Memory (RSS)</span>
+                        <i class="fa-solid fa-memory icon-mem"></i>
+                    </div>
+                    <div class="card-value"><span id="metric-mem">0.00</span> <span class="unit">MB</span></div>
+                    <div class="card-bar-wrapper">
+                        <div class="card-bar" id="bar-mem" style="width: 0%"></div>
+                    </div>
+                    <div class="card-subtext">Stabilization Target: &lt; 1024 MB</div>
+                </div>
+
+                <!-- 3. Active OS Handles Card -->
+                <div class="metric-card">
+                    <div class="card-header">
+                        <span>Open Sockets & Handles</span>
+                        <i class="fa-solid fa-network-wired icon-fds"></i>
+                    </div>
+                    <div class="card-value"><span id="metric-fds">0</span></div>
+                    <div class="card-bar-wrapper">
+                        <div class="card-bar" id="bar-fds" style="width: 0%"></div>
+                    </div>
+                    <div class="card-subtext">Leak Safety Limit: 100</div>
+                </div>
+
+                <!-- 4. Queue Backlog Card -->
+                <div class="metric-card">
+                    <div class="card-header">
+                        <span>RabbitMQ Backlog</span>
+                        <i class="fa-solid fa-list-ol icon-queue"></i>
+                    </div>
+                    <div class="card-value"><span id="metric-queue">0</span> <span class="unit">tasks</span></div>
+                    <div class="card-bar-wrapper">
+                        <div class="card-bar" id="bar-queue" style="width: 0%"></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Chart & Tasks Section -->
+            <section class="dashboard-body">
+                <!-- Real-time Latency Chart -->
+                <div class="chart-container card-panel">
+                    <h3>ONNX Model Execution Latency (Real-Time)</h3>
+                    <div class="svg-chart-wrapper">
+                        <!-- Custom vector SVG line chart that redraws dynamically -->
+                        <svg id="latency-svg" viewBox="0 0 500 200" preserveAspectRatio="none">
+                            <defs>
+                                <linearGradient id="chart-grad" x1="0%" y1="0%" x2="0%" y2="100%">
+                                    <stop offset="0%" stop-color="rgba(0, 198, 255, 0.4)" />
+                                    <stop offset="100%" stop-color="rgba(0, 198, 255, 0)" />
+                                </linearGradient>
+                            </defs>
+                            <path id="chart-area" d="" fill="url(#chart-grad)"></path>
+                            <path id="chart-line" d="" fill="none" stroke="#00c6ff" stroke-width="2"></path>
+                        </svg>
+                        <div class="chart-y-axis">
+                            <span>40ms</span>
+                            <span>20ms</span>
+                            <span>0ms</span>
+                        </div>
+                    </div>
+                    <div class="chart-footer">
+                        <span>Average Latency: <strong id="avg-latency-text">0.0ms</strong></span>
+                        <span>Updates: Every 1s</span>
+                    </div>
+                </div>
+
+                <!-- Task Runner and Chaos Sandbox -->
+                <div class="controls-panel">
+                    
+                    <!-- Task Runner Card -->
+                    <div class="card-panel" id="runner-panel">
+                        <h3><i class="fa-solid fa-play"></i> Run AI Model Inference</h3>
+                        <form id="task-form">
+                            <div class="form-group">
+                                <label for="task-query">Input Query (Symptoms / Report Text)</label>
+                                <input type="text" id="task-query" placeholder="e.g. Spleen tissue volume is normal..." required>
+                            </div>
+                            <div class="form-group">
+                                <label for="task-type">Model Type</label>
+                                <select id="task-type">
+                                    <option value="text">Clinical text prediction (10-input TinyModel)</option>
+                                    <option value="image">Image segmentation (ResNet/U-Net simulation)</option>
+                                </select>
+                            </div>
+                            <button type="submit" class="btn btn-primary" id="btn-submit">
+                                <i class="fa-solid fa-bolt"></i> Submit to Pipeline
+                            </button>
+                        </form>
+                    </div>
+
+                    <!-- Chaos Sandbox Card -->
+                    <div class="card-panel" id="chaos-panel">
+                        <h3><i class="fa-solid fa-circle-radiation"></i> Chaos Engineering Sandbox</h3>
+                        <p class="panel-desc">Simulate production failures to test Circuit Breaker and RAM auto-stabilization.</p>
+                        <div class="chaos-btn-group">
+                            <button class="btn btn-chaos-danger" id="chaos-trip">
+                                <i class="fa-solid fa-plug-circle-xmark"></i> Fail RabbitMQ Connection
+                            </button>
+                            <button class="btn btn-chaos-warning" id="chaos-leak">
+                                <i class="fa-solid fa-dumpster-fire"></i> Inject RAM/FD Leak
+                            </button>
+                            <button class="btn btn-chaos-success" id="chaos-reset">
+                                <i class="fa-solid fa-rotate-left"></i> Reset System Health
+                            </button>
+                        </div>
+                    </div>
+
+                </div>
+            </section>
+
+            <!-- Console Log Panel -->
+            <section class="console-panel card-panel">
+                <div class="console-header">
+                    <h3><i class="fa-solid fa-terminal"></i> Live Event Console</h3>
+                    <button id="clear-console" class="btn btn-text"><i class="fa-solid fa-trash-can"></i> Clear</button>
+                </div>
+                <div class="console-box" id="console-logs">
+                    <div class="log-line system">[SYSTEM] Welcome to AetherInference Dashboard. Waiting for data streams...</div>
+                </div>
+            </section>
+
+        </main>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>

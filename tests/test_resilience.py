@@ -78,3 +78,78 @@ def test_resource_monitor_limits_pass():
     assert metrics["memory_ok"] is True
     assert metrics["handles_ok"] is True
     assert metrics["action_taken"] == "none"
+
+def test_chaos_flow_and_rejection():
+    """Test the complete chaos injection lifecycle using the FastAPI TestClient."""
+    from fastapi.testclient import TestClient
+    from gateway.main import app, circuit_breaker
+    
+    client = TestClient(app)
+    
+    # 1. Reset health first to ensure clean state
+    response = client.post("/chaos/reset")
+    assert response.status_code == 200
+    assert response.json()["message"] == "System health restored to healthy defaults."
+    
+    # Verify app state variables
+    assert app.state.chaos_rabbitmq is False
+    assert app.state.chaos_mem_leak == 0.0
+    assert app.state.chaos_handles_leak == 0
+    assert circuit_breaker.state == "CLOSED"
+    
+    # 2. Inject RAM/FD leak
+    response = client.post("/chaos/leak")
+    assert response.status_code == 200
+    assert response.json()["simulated_memory_leak_mb"] == 250.0
+    assert response.json()["simulated_handles_leak"] == 20
+    assert app.state.chaos_mem_leak == 250.0
+    assert app.state.chaos_handles_leak == 20
+    
+    # 3. Trip RabbitMQ Connection simulation
+    response = client.post("/chaos/trip")
+    assert response.status_code == 200
+    assert app.state.chaos_rabbitmq is True
+    
+    # 4. Make requests to trip the circuit breaker
+    # It takes 3 failures to trip since threshold is 3 in main.py
+    payload = {"query": "Spleen check", "task_type": "text"}
+    
+    # Call 1 (failure)
+    response = client.post("/submit", json=payload)
+    assert response.status_code == 503
+    
+    # Call 2 (failure)
+    response = client.post("/submit", json=payload)
+    assert response.status_code == 503
+    
+    # Call 3 (failure) - this should transition circuit breaker to OPEN
+    response = client.post("/submit", json=payload)
+    assert response.status_code == 503
+    assert circuit_breaker.state == "OPEN"
+    
+    # Call 4 (should block and return queued_fallback gracefully!)
+    response = client.post("/submit", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "queued_fallback"
+    assert data["circuit_state"] == "OPEN"
+    
+    # 5. Simulate memory limit overload rejection (503 status code)
+    # Set chaos_mem_leak high enough to exceed memory_limit_mb (1024 MB in main.py)
+    app.state.chaos_mem_leak = 1500.0
+    response = client.post("/submit", json=payload)
+    assert response.status_code == 503
+    assert "Server is overloaded" in response.json()["detail"]
+    
+    # 6. Reset system health and verify it returns to normal
+    response = client.post("/chaos/reset")
+    assert response.status_code == 200
+    assert app.state.chaos_rabbitmq is False
+    assert app.state.chaos_mem_leak == 0.0
+    assert app.state.chaos_handles_leak == 0
+    assert circuit_breaker.state == "CLOSED"
+    
+    # Normal submission should pass now (should return queued_mock or queued depending on environment)
+    response = client.post("/submit", json=payload)
+    assert response.status_code == 200
+    assert response.json()["status"].startswith("queued")

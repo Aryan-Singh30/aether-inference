@@ -1,5 +1,6 @@
 import time
 import logging
+import json
 import numpy as np
 import faiss
 import redis
