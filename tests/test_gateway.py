@@ -27,7 +27,7 @@ def test_submit_task_success():
     assert response.status_code == 200
     
     data = response.json()
-    assert data["status"] == "queued"
+    assert data["status"].startswith("queued")
     assert "task_id" in data
 
 def test_submit_task_validation_error():

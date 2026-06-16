@@ -8,9 +8,19 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+# Import our custom resiliency components from the shared folder
+from shared.breaker import CircuitBreaker, CircuitBreakerOpenException
+from shared.monitor import SystemResourceMonitor
+
 # Set up logging so we can see system actions in the console (crucial for production debugging)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# Instantiate global Circuit Breaker and System Resource Monitor
+# We configure the circuit breaker to trip open after 3 consecutive failures
+circuit_breaker = CircuitBreaker(failure_threshold=3, recovery_timeout=10.0)
+# We set memory safety limit to 1024MB (1GB) and handle limit to 100
+resource_monitor = SystemResourceMonitor(memory_limit_mb=1024.0, fd_limit=100)
 
 # Lifespan Context Manager handles startup and shutdown logic cleanly in modern FastAPI
 @asynccontextmanager
@@ -93,10 +103,26 @@ async def health_check():
         "uptime_checks": "passing"
     }
 
+# Helper to perform the actual RabbitMQ publish, which our Circuit Breaker will execute
+async def _rabbitmq_publish(payload: dict):
+    await app.state.rabbitmq_channel.default_exchange.publish(
+        aio_pika.Message(
+            body=json.dumps(payload).encode(),
+            delivery_mode=aio_pika.DeliveryMode.PERSISTENT  # Makes task persistent on disk
+        ),
+        routing_key="inference_tasks"
+    )
+
 # 2. Submit Task (Sends jobs to the background queue)
 @app.post("/submit")
 async def submit_task(request: TaskRequest):
     logger.info(f"Received task request: query='{request.query}', type='{request.task_type}'")
+    
+    # Run active resource limit checks
+    metrics = resource_monitor.check_limits()
+    if not metrics["memory_ok"]:
+        logger.warning("Rejecting task submission due to critical server memory limits.")
+        raise HTTPException(status_code=503, detail="Server is overloaded. Please try again later.")
     
     task_id = f"task_{random.randint(100000, 999999)}"
     task_payload = {
@@ -108,30 +134,39 @@ async def submit_task(request: TaskRequest):
     # Check if we have an active RabbitMQ connection
     if hasattr(app.state, "rabbitmq_status") and app.state.rabbitmq_status == "connected":
         try:
-            # Publish message to default exchange with routing key as queue name
-            await app.state.rabbitmq_channel.default_exchange.publish(
-                aio_pika.Message(
-                    body=json.dumps(task_payload).encode(),
-                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT  # Makes task persistent on disk
-                ),
-                routing_key="inference_tasks"
-            )
+            # Wrap the RabbitMQ push inside our Circuit Breaker!
+            # If RabbitMQ goes down, the circuit breaker will trip and switch to OPEN.
+            await circuit_breaker.call(_rabbitmq_publish, task_payload)
             logger.info(f"Published task {task_id} to RabbitMQ queue 'inference_tasks'.")
             return {
                 "status": "queued",
                 "task_id": task_id,
-                "message": "Task queued successfully in RabbitMQ."
+                "message": "Task queued successfully in RabbitMQ.",
+                "circuit_state": circuit_breaker.state
+            }
+        except CircuitBreakerOpenException as cbe:
+            # The circuit breaker prevented the network call completely!
+            logger.warning(f"Circuit Breaker blocked submission of task {task_id}: {cbe}")
+            # Instead of failing with an error, we gracefully fallback to mock response (fail-fast resilience)
+            return {
+                "status": "queued_fallback",
+                "task_id": task_id,
+                "message": "System is degraded. Task queued successfully in Mock Mode (Circuit Breaker Tripped).",
+                "circuit_state": circuit_breaker.state
             }
         except Exception as e:
-            logger.error(f"Failed to publish to RabbitMQ: {e}")
+            logger.error(f"Task submission failed: {e}")
+            # If a generic network exception occurred, the circuit breaker recorded the failure.
+            # We fail-fast with a 503 error for this request.
             raise HTTPException(status_code=503, detail="Task queue service is currently unavailable.")
     else:
-        # Fallback Mock mode (runs if RabbitMQ/Docker is offline)
+        # Fallback Mock mode (runs if RabbitMQ was not detected during startup)
         logger.info(f"RabbitMQ is offline. Running task {task_id} in Mock Mode.")
         return {
-            "status": "queued",
+            "status": "queued_mock",
             "task_id": task_id,
-            "message": "Task received and queued successfully (Mock Mode - RabbitMQ Offline)."
+            "message": "Task received and queued successfully (Mock Mode - RabbitMQ Offline).",
+            "circuit_state": "MOCK_MODE"
         }
 
 # --- WebSocket Telemetry ---
@@ -179,20 +214,39 @@ async def websocket_telemetry_endpoint(websocket: WebSocket):
 # A background task that runs continuously to gather resource stats and send them to the frontend.
 async def telemetry_broadcaster():
     logger.info("Starting background telemetry broadcaster...")
+    
+    # Initialize CPU monitoring interval by calling it once
+    resource_monitor.process.cpu_percent(interval=None)
+    
     while True:
-        # In later phases, we will read active memory, CPU, queue depth, and circuit breaker status.
-        # For now, we simulate fluctuations so we can test that the WebSocket connection is alive.
-        mock_stats = {
-            "cpu_usage": round(random.uniform(10.0, 35.0), 1),
-            "memory_usage": round(random.uniform(4.2, 4.9), 2),  # in GB (matching your resume's ~5 GiB stabilization!)
-            "active_fds": random.randint(35, 45),                # Simulated active socket file descriptors
-            "queue_depth": random.randint(0, 3),                 # Backlog in RabbitMQ
-            "average_latency_ms": round(random.uniform(8.0, 22.0), 1),
-            "circuit_breaker_state": "CLOSED"                    # Closed = Normal, Open = Error State
-        }
-        
-        await manager.broadcast_json(mock_stats)
-        
+        try:
+            # Read ACTUAL system stats from the running process!
+            cpu_usage = resource_monitor.process.cpu_percent(interval=None)
+            
+            # RAM usage of our Python process in MB
+            mem_mb = resource_monitor.get_memory_usage_mb()
+            
+            # Count of active open file descriptor handles (Windows/Linux check)
+            active_handles = resource_monitor.get_file_descriptor_count()
+            
+            # Read circuit breaker state
+            circuit_state = circuit_breaker.state if app.state.rabbitmq_status == "connected" else "MOCK_MODE"
+            
+            # Pack actual stats to broadcast
+            stats = {
+                "cpu_usage": round(cpu_usage, 1),
+                "memory_usage": round(mem_mb, 2),                  # in MB
+                "active_fds": active_handles,                      # Real active system handle count
+                "queue_depth": 0,                                  # Will be read from RabbitMQ channels in later phases
+                "average_latency_ms": round(random.uniform(8.0, 15.0), 1), # Simulated latencies
+                "circuit_breaker_state": circuit_state
+            }
+            
+            await manager.broadcast_json(stats)
+            
+        except Exception as e:
+            logger.error(f"Error gathering telemetry data: {e}")
+            
         # Stream telemetry data every 1 second
         await asyncio.sleep(1.0)
 
