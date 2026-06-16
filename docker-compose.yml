@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  # 1. Redis Cache
+  # Uses a lightweight Alpine Linux distribution of Redis 7
+  redis:
+    image: redis:7-alpine
+    container_name: aether_redis
+    ports:
+      - "6379:6379"  # Maps port 6379 on your computer to port 6379 inside the container
+    restart: always  # Auto-restarts if the database crashes
+
+  # 2. RabbitMQ Message Queue
+  # Uses the management-alpine image which pre-installs the web dashboard UI
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: aether_rabbitmq
+    ports:
+      - "5672:5672"    # Main port for sending and receiving queue messages
+      - "15672:15672"  # Management dashboard web UI port
+    environment:
+      # Sets default login credentials for the admin dashboard
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    restart: always

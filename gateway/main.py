@@ -1,8 +1,10 @@
 import asyncio
+import json
 import logging
 import random
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import aio_pika
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -13,17 +15,46 @@ logger = logging.getLogger(__name__)
 # Lifespan Context Manager handles startup and shutdown logic cleanly in modern FastAPI
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Start the background telemetry broadcaster
+    # Startup: Initialize RabbitMQ connection
     logger.info("Initializing background services...")
+    
+    try:
+        # Connect to RabbitMQ using standard default local credentials
+        connection = await aio_pika.connect_robust(
+            "amqp://guest:guest@localhost:5672/",
+            timeout=5  # Timeout quickly if RabbitMQ is not running
+        )
+        channel = await connection.channel()
+        
+        # Declare a durable queue. "Durable" means the queue survives RabbitMQ restarts
+        await channel.declare_queue("inference_tasks", durable=True)
+        
+        # Store connection/channel in app.state so our API endpoints can access them
+        app.state.rabbitmq_connection = connection
+        app.state.rabbitmq_channel = channel
+        app.state.rabbitmq_status = "connected"
+        logger.info("Successfully connected to RabbitMQ.")
+    except Exception as e:
+        logger.warning(f"Could not connect to RabbitMQ (running in Mock Mode): {e}")
+        app.state.rabbitmq_status = "disconnected"
+
+    # Start the background telemetry loop
     telemetry_task = asyncio.create_task(telemetry_broadcaster())
+    
     yield
-    # Shutdown: Clean up background tasks
+    
+    # Shutdown: Clean up background tasks and connections
     logger.info("Shutting down background services...")
     telemetry_task.cancel()
     try:
         await telemetry_task
     except asyncio.CancelledError:
         pass
+
+    # Clean up the RabbitMQ connection if it was created
+    if hasattr(app.state, "rabbitmq_connection") and app.state.rabbitmq_status == "connected":
+        await app.state.rabbitmq_connection.close()
+        logger.info("RabbitMQ connection closed.")
 
 # Initialize the FastAPI App with the lifespan manager
 app = FastAPI(
@@ -67,15 +98,41 @@ async def health_check():
 async def submit_task(request: TaskRequest):
     logger.info(f"Received task request: query='{request.query}', type='{request.task_type}'")
     
-    # In Phase 3, we will push this task into the RabbitMQ queue.
-    # For now (Phase 2), we simulate a successful task queueing and return a mock tracking ID.
-    mock_task_id = f"task_{random.randint(100000, 999999)}"
-    
-    return {
-        "status": "queued",
-        "task_id": mock_task_id,
-        "message": "Task received and queued successfully (Mock Mode)."
+    task_id = f"task_{random.randint(100000, 999999)}"
+    task_payload = {
+        "task_id": task_id,
+        "query": request.query,
+        "task_type": request.task_type
     }
+    
+    # Check if we have an active RabbitMQ connection
+    if hasattr(app.state, "rabbitmq_status") and app.state.rabbitmq_status == "connected":
+        try:
+            # Publish message to default exchange with routing key as queue name
+            await app.state.rabbitmq_channel.default_exchange.publish(
+                aio_pika.Message(
+                    body=json.dumps(task_payload).encode(),
+                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT  # Makes task persistent on disk
+                ),
+                routing_key="inference_tasks"
+            )
+            logger.info(f"Published task {task_id} to RabbitMQ queue 'inference_tasks'.")
+            return {
+                "status": "queued",
+                "task_id": task_id,
+                "message": "Task queued successfully in RabbitMQ."
+            }
+        except Exception as e:
+            logger.error(f"Failed to publish to RabbitMQ: {e}")
+            raise HTTPException(status_code=503, detail="Task queue service is currently unavailable.")
+    else:
+        # Fallback Mock mode (runs if RabbitMQ/Docker is offline)
+        logger.info(f"RabbitMQ is offline. Running task {task_id} in Mock Mode.")
+        return {
+            "status": "queued",
+            "task_id": task_id,
+            "message": "Task received and queued successfully (Mock Mode - RabbitMQ Offline)."
+        }
 
 # --- WebSocket Telemetry ---
 # WebSockets keep a permanent open pipe between the client and server.
