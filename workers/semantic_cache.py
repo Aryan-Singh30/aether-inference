@@ -14,8 +14,11 @@ class SemanticCache:
     Falls back gracefully to a local in-memory dictionary cache if Redis is offline.
     """
     
-    def __init__(self, distance_threshold: float = 0.95, redis_url: str = "redis://localhost:6379"):
+    def __init__(self, distance_threshold: float = 0.95, redis_url: str = None):
         self.threshold = distance_threshold
+        import os
+        if redis_url is None:
+            redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
         
         # 1. Load a fast, lightweight embedding model (all-MiniLM-L6-v2 generates 384-dimension vectors)
         logger.info("Loading local embedding model (all-MiniLM-L6-v2)...")

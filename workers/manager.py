@@ -57,10 +57,10 @@ class AsyncWorker:
             sys.exit(1)
 
         # 2. Connect to RabbitMQ
-        logger.info("Connecting to RabbitMQ...")
-        self.connection = await aio_pika.connect_robust(
-            "amqp://guest:guest@localhost:5672/"
-        )
+        import os
+        rabbitmq_url = os.getenv("RABBITMQ_URL") or os.getenv("CLOUDAMQP_URL") or "amqp://guest:guest@localhost:5672/"
+        logger.info(f"Connecting to RabbitMQ (URL: {rabbitmq_url})...")
+        self.connection = await aio_pika.connect_robust(rabbitmq_url)
         self.channel = await self.connection.channel()
         
         # Limit the number of messages pre-fetched to 1 (fair dispatch)

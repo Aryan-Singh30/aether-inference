@@ -33,10 +33,28 @@ async def lifespan(app: FastAPI):
     app.state.chaos_mem_leak = 0.0
     app.state.chaos_handles_leak = 0
     
+    # 1. Start background worker subprocess if configured (for Render single-service free tier)
+    import os
+    if os.getenv("START_BACKGROUND_WORKER", "false").lower() == "true":
+        logger.info("Production configuration: Launching background worker process...")
+        import subprocess
+        import sys
+        try:
+            env = os.environ.copy()
+            env["PYTHONPATH"] = os.getcwd()
+            app.state.worker_process = subprocess.Popen(
+                [sys.executable, "workers/manager.py"],
+                env=env
+            )
+            logger.info("Background worker process launched successfully.")
+        except Exception as e:
+            logger.error(f"Failed to launch background worker process: {e}")
+
     try:
-        # Connect to RabbitMQ using standard default local credentials
+        # Connect to RabbitMQ using environment credentials or local fallback
+        rabbitmq_url = os.getenv("RABBITMQ_URL") or os.getenv("CLOUDAMQP_URL") or "amqp://guest:guest@localhost:5672/"
         connection = await aio_pika.connect_robust(
-            "amqp://guest:guest@localhost:5672/",
+            rabbitmq_url,
             timeout=5  # Timeout quickly if RabbitMQ is not running
         )
         channel = await connection.channel()
@@ -58,13 +76,23 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Shutdown: Clean up background tasks and connections
+    # Shutdown: Clean up background tasks, worker processes, and connections
     logger.info("Shutting down background services...")
     telemetry_task.cancel()
     try:
         await telemetry_task
     except asyncio.CancelledError:
         pass
+
+    # Clean up the worker process if it was started
+    if hasattr(app.state, "worker_process"):
+        logger.info("Stopping background worker process...")
+        app.state.worker_process.terminate()
+        try:
+            app.state.worker_process.wait(timeout=5)
+        except Exception:
+            app.state.worker_process.kill()
+        logger.info("Background worker process stopped.")
 
     # Clean up the RabbitMQ connection if it was created
     if hasattr(app.state, "rabbitmq_connection") and app.state.rabbitmq_status == "connected":
