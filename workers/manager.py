@@ -7,8 +7,10 @@ import sys
 import aio_pika
 try:
     from workers.inference_engine import ONNXInferenceEngine
+    from workers.semantic_cache import SemanticCache
 except ModuleNotFoundError:
     from inference_engine import ONNXInferenceEngine
+    from semantic_cache import SemanticCache
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
@@ -36,19 +38,22 @@ def query_to_vector(query_str: str) -> list[float]:
 class AsyncWorker:
     def __init__(self):
         self.engine = None
+        self.cache = None
         self.connection = None
         self.channel = None
         self.is_running = True
 
     async def start(self):
-        """Starts the worker, loading the model and listening to the queue."""
+        """Starts the worker, loading the model, initializing the cache, and listening to the queue."""
         logger.info("Starting Async Worker...")
         
-        # 1. Load the ONNX model once
+        # 1. Load the ONNX model once and initialize semantic cache
         try:
             self.engine = ONNXInferenceEngine()
+            # Initialize the semantic cache with 95% similarity threshold
+            self.cache = SemanticCache(distance_threshold=0.95)
         except Exception as e:
-            logger.critical(f"Failed to load ONNX model: {e}")
+            logger.critical(f"Failed to initialize worker services: {e}")
             sys.exit(1)
 
         # 2. Connect to RabbitMQ
@@ -91,10 +96,22 @@ class AsyncWorker:
                 
                 logger.info(f"Processing task {task_id} (Type: {task_type}) - Raw query: '{query}'")
                 
-                # 2. Convert text to numerical input features for our ONNX model
+                # 2. Check the Semantic Cache first!
+                cached_data, similarity = self.cache.query(query)
+                if cached_data:
+                    predictions = cached_data.get("predictions")
+                    latency = cached_data.get("latency_ms")
+                    logger.info(
+                        f"Task {task_id} resolved via Semantic Cache Hit! "
+                        f"Similarity: {similarity:.4f}. Latency: {latency:.2f}ms. "
+                        f"Predictions: {predictions}"
+                    )
+                    return
+                
+                # 3. Cache Miss: Convert text to numerical input features for our ONNX model
                 input_vector = query_to_vector(query)
                 
-                # 3. Execute ONNX Runtime inference
+                # 4. Execute ONNX Runtime inference
                 # To prevent blocking the async event loop with heavy calculations,
                 # we run the CPU-bound inference in a separate thread.
                 loop = asyncio.get_running_loop()
@@ -104,9 +121,17 @@ class AsyncWorker:
                     input_vector
                 )
                 
+                # 5. Save the output to the Semantic Cache for future speedups
+                cache_payload = {
+                    "predictions": predictions,
+                    "latency_ms": latency,
+                    "model_source": "onnx"
+                }
+                self.cache.add(query, cache_payload)
+                
                 logger.info(
-                    f"Task {task_id} completed. ONNX Latency: {latency:.2f}ms. "
-                    f"Output Predictions: {predictions}"
+                    f"Task {task_id} completed via ONNX Runtime inference. "
+                    f"ONNX Latency: {latency:.2f}ms. Output Predictions: {predictions}"
                 )
                 
             except json.JSONDecodeError:
